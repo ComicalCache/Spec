@@ -1,0 +1,12 @@
+[package]
+name = "specialize_fn"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# TODO: remove extra traits
+syn = { version = "2.0.82", features = ["full", "extra-traits"] }
+quote = "1.0.37"
+
+[lib]
+proc-macro = true
