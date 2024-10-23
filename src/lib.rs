@@ -1,207 +1,108 @@
-#![feature(proc_macro_span)]
-
-use std::{
-    hash::{DefaultHasher, Hash, Hasher},
-    ops::Not,
-};
-
-use quote::{format_ident, ToTokens};
+use proc_macro::TokenStream;
+use proc_macro2::{Span, TokenStream as TokenStream2};
+use quote::{quote_spanned, ToTokens};
 use syn::{
-    parse_macro_input, FnArg, Ident, ImplItem, ImplItemFn, Item, ItemFn, Meta, MetaList, Pat,
+    parse_macro_input, parse_quote, parse_quote_spanned, punctuated::Punctuated, spanned::Spanned,
+    token::Comma, Arm, Attribute, Block, Expr, ExprMatch, ExprPath, FnArg, ItemFn, Meta, Pat, Path,
+    PathSegment, Signature,
 };
 
-use proc_macro::{Span, TokenStream};
-
-struct Pattern {
-    pattern: String,
-    func: String,
-}
-
-impl Pattern {
-    pub fn new(token: &proc_macro2::TokenStream, func: String) -> Self {
-        Pattern {
-            pattern: format!("({token})"),
-            func,
-        }
+/// Create spanned compile error
+fn error(span: &Span, e: &'static str) -> TokenStream {
+    quote_spanned! {
+        *span =>
+        compile_error!(#e)
     }
+    .into()
 }
 
-fn hash_ident(ident: &Ident, hasher: impl Hasher) -> String {
-    format_ident!("{}_{:x}", ident, hasher.finish()).to_string()
-}
+/// Parse the parameter names of the `#[spec]` function and make them into a comma
+/// separated list
+fn param_to_tuple(sig: &Signature) -> Punctuated<Expr, Comma> {
+    let mut punc_seq: Punctuated<Expr, Comma> = Punctuated::new();
 
-fn hash_impl_ident(ident: &Ident, hasher: impl Hasher) -> String {
-    format!("self.{}", hash_ident(ident, hasher))
-}
-
-fn has_attr(list: &MetaList) -> bool {
-    list.path
-        .segments
-        .iter()
-        .map(|seg| seg.ident.to_string())
-        .any(|seg| seg == "case")
-}
-
-#[proc_macro_attribute]
-/// Creates a case for a specialized function.
-///
-/// The function must have an identical signature (except for parameter destructuring)
-/// as the spec function.
-///
-/// The order of definition is the order of checking the cases, the first matching
-/// pattern will be used.
-pub fn case(attr: TokenStream, item: TokenStream) -> TokenStream {
-    // randomize function name by using hashed pattern
-    // => makes it so only `spec`` function is left with original name
-    // => no multiple function declaration and normal function call syntax
-
-    let mut hasher = DefaultHasher::new();
-    attr.to_string().hash(&mut hasher);
-
-    let mut input = parse_macro_input!(item as syn::ItemFn);
-    // yes.. this double format_ident! is stupid, but oh well
-    input.sig.ident = format_ident!("{}", hash_ident(&input.sig.ident, hasher));
-    input.to_token_stream().into()
-}
-
-#[proc_macro_attribute]
-/// Specify a function definition to be completed by an exhaustive
-/// series of case implementations for the parameter cases.
-pub fn spec(_: TokenStream, item: TokenStream) -> TokenStream {
-    // build a match statement based on all the patterns
-    // declared by #[case(...)] to pass to appropriate
-    // function
-
-    let mut input = parse_macro_input!(item as syn::ItemFn);
-
-    // parse parameter names of function arguments to pass to cases later
-    let mut params: Vec<String> = Vec::new();
-    for arg in input.sig.inputs.iter() {
+    for arg in sig.inputs.iter() {
         match arg {
             FnArg::Typed(arg) => match arg.pat.as_ref() {
-                Pat::Ident(id) => params.push(id.ident.to_string()),
+                Pat::Ident(id) => {
+                    punc_seq.push(Expr::from(ExprPath {
+                        attrs: Vec::new(),
+                        qself: None,
+                        path: Path::from(PathSegment::from(id.ident.clone())),
+                    }));
+                }
                 _ => panic!("Does not support non-ident arguments"),
             },
             _ => continue,
         }
     }
-    let params = params.join(",");
 
-    // open the file of definition to access to all to this #[spec]
-    // belonging #[case(...)] functions
-    // !! THIS LIMITS THE CASES TO BE IN THE SAME FILE !!
-    // TODO: add that spec can have a list of files to also check
-    let span = Span::call_site();
-    let source = span.source_file();
-    let src_file =
-        std::fs::read_to_string(source.path()).expect("Failed to open and read the source file");
-    let src_file = syn::parse_file(&src_file).expect("Failed to parse source file");
-
-    let patterns = iter_items(&input.sig.ident, &src_file.items);
-
-    // build match statement with all the patterns and replace function body
-    let mut match_arms = String::new();
-    for Pattern { pattern, func } in patterns {
-        match_arms.push_str(format!("{pattern}=>{func}({params}),").as_ref());
-    }
-    let block = format!("{{match({params}){{{match_arms}}}}}")
-        .parse::<TokenStream>()
-        .expect("Failed to parse function match arms");
-
-    let block = Box::new(parse_macro_input!(block as syn::Block));
-    input.block = block;
-
-    input.to_token_stream().into()
+    punc_seq
 }
 
-/// Iter (recursively) over all items in a module, finding all #[case(...)] attributed
-/// functions with same function name
-fn iter_items(ident: &Ident, items: &Vec<Item>) -> Vec<Pattern> {
-    // TODO: check if #[spec] function is Fn, ImplItemFn or in same mod
-    let mut patterns: Vec<Pattern> = Vec::new();
+#[proc_macro]
+pub fn spec(item: TokenStream) -> TokenStream {
+    // TODO: support impl with good auto complete
 
-    for item in items {
-        match item {
-            Item::Fn(func) => {
-                if let Some(mut new) = item_fn(ident, &func) {
-                    patterns.append(&mut new);
-                }
-            }
-            Item::Impl(r#impl) => {
-                for item in r#impl.items.iter() {
-                    match item {
-                        ImplItem::Fn(func) => {
-                            if let Some(mut new) = impl_item_fn(ident, &func) {
-                                patterns.append(&mut new);
-                            }
-                        }
-                        _ => continue,
-                    }
-                }
-            }
-            Item::Mod(r#mod) => {
-                if let Some(content) = &r#mod.content {
-                    let mut new = iter_items(ident, &content.1);
-                    patterns.append(&mut new);
-                }
-            }
-            _ => continue,
+    // Brace input so it can be parsed as block
+    let item = TokenStream2::from(item);
+    let input: Block = parse_quote_spanned!( item.span() => { #item } );
+    let mut stmts = input.stmts.iter();
+
+    // Parse function specification
+    let mut spec_func = if let Some(func) = stmts.next() {
+        let stmt: TokenStream = func.to_token_stream().into();
+        let mut func = parse_macro_input!(stmt as ItemFn);
+
+        // TODO: check for flags like "strict name" or "strict parameters":
+        // - strict name: enforces name of #[spec] and #[case] functions to be identical
+        // - strict parameters: enforces parameters of #[spec] and #[case] functions to be identical
+        let expected_attr: Attribute = parse_quote!( #[spec] );
+        if let Some(attr_index) = func.attrs.iter().position(|attr| *attr == expected_attr) {
+            // Attribute was only needed for identification
+            func.attrs.remove(attr_index);
+        } else {
+            return error(
+                &func.span(),
+                "Expected the first function to be the function \
+                pecification with the #[spec] attribute",
+            );
+        }
+        func
+    } else {
+        return error(&input.span(), "spec!{{}} block must not be empty");
+    };
+
+    // Create the match statement
+    let spec_func_parameters = param_to_tuple(&spec_func.sig);
+    let mut expr_match: ExprMatch = parse_quote_spanned!( spec_func.span() =>
+        #[allow(unused_parens)]
+        match (#spec_func_parameters) {}
+    );
+
+    // Parse the pattern and function body of each case and assemble the match statement
+    for stmt in stmts {
+        let stmt: TokenStream = stmt.to_token_stream().into();
+        let func = parse_macro_input!(stmt as ItemFn);
+
+        // TODO: check for flags like "if":
+        // - if: adds an if clause to the match arm
+        if func.attrs.len() != 1 {
+            return error(&func.span(), "Expected only #[case(...)]");
+        }
+
+        if let Meta::List(attr) = &func.attrs[0].meta {
+            let pattern = &attr.tokens;
+            let body = func.block;
+            let arm: Arm = parse_quote_spanned!( spec_func.span() => (#pattern) => #body );
+            expr_match.arms.push(arm);
+        } else {
+            return error(&func.span(), "Expected only #[case(...)]");
         }
     }
 
-    patterns
-}
+    let body: Block = parse_quote_spanned!( spec_func.span() => { #expr_match } );
+    spec_func.block = Box::new(body);
 
-/// Find case functions on global scope
-fn item_fn(ident: &Ident, func: &ItemFn) -> Option<Vec<Pattern>> {
-    // ignore other functions (that may also have #[case(...)] attribute)
-    if func.sig.ident != *ident {
-        return None;
-    }
-
-    let mut patterns: Vec<Pattern> = Vec::new();
-    for attr in func.attrs.iter() {
-        match &attr.meta {
-            Meta::List(attr) => {
-                // check if fn has #[case(...)] attribute
-                if has_attr(attr).not() {
-                    continue;
-                }
-
-                let mut hasher = DefaultHasher::new();
-                attr.tokens.to_string().hash(&mut hasher);
-                patterns.push(Pattern::new(&attr.tokens, hash_ident(ident, hasher)));
-            }
-            _ => continue,
-        }
-    }
-
-    Some(patterns)
-}
-
-/// Find case functions on impl scope
-fn impl_item_fn(ident: &Ident, func: &ImplItemFn) -> Option<Vec<Pattern>> {
-    // ignore other functions (that may also have #[case(...)] attribute)
-    if func.sig.ident != *ident {
-        return None;
-    }
-
-    let mut patterns: Vec<Pattern> = Vec::new();
-    for attr in func.attrs.iter() {
-        match &attr.meta {
-            Meta::List(attr) => {
-                // check if fn has #[case(...)] attribute
-                if has_attr(attr).not() {
-                    continue;
-                }
-
-                let mut hasher = DefaultHasher::new();
-                attr.tokens.to_string().hash(&mut hasher);
-                patterns.push(Pattern::new(&attr.tokens, hash_impl_ident(ident, hasher)));
-            }
-            _ => continue,
-        }
-    }
-
-    Some(patterns)
+    spec_func.to_token_stream().into()
 }
