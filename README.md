@@ -1,6 +1,6 @@
 ## spec
 
-A proof-of-concept crate of adding "function specialization" to rust.
+A proof-of-concept crate of adding "function specialization" to rust. It currently supports regular parameters, wild card (`_`) parameters and tuple destructuring. Struct destructuring is not yet supported.
 
 The crate allows defining a function and its specialized cases, using rusts match statements to create a "specialized function". This has the neat side effect of getting exhaustive pattern enforcement by rust itself while staying light weight.
 
