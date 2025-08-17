@@ -1,7 +1,11 @@
 [package]
-name = "spec"
+name = "spec-fn"
 version = "1.0.0"
 edition = "2021"
+license = "GPL-3.0"
+description = "A proof-of-concept crate of adding 'function specialization' to rust"
+repository = "https://github.com/ComicalCache/Spec"
+readme = "README.md"
 
 [dependencies]
 # TODO: remove extra traits
